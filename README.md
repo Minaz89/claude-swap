@@ -2,6 +2,8 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
+> **Claude Code skill included.** This repo also ships a [`cswap-operator`](skills/cswap-operator/) skill so Claude Code can *drive* `cswap` for you in plain English — *"show my usage"*, *"switch me to a fresh account"*, *"set up auto-rotation"*. Install it from [`skills/cswap-operator/README.md`](skills/cswap-operator/README.md).
+
 ## Installation
 
 ### Using uv (recommended)
