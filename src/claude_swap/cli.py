@@ -10,7 +10,15 @@ import sys
 from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
-from claude_swap.printer import dimmed, error, force_utf8_output, muted
+from claude_swap.printer import (
+    accent,
+    bolded,
+    dimmed,
+    error,
+    force_utf8_output,
+    muted,
+    warning,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -47,6 +55,8 @@ _SUBCOMMAND_FLAGS = {
     "add-token": "--add-token",
     "remove": "--remove-account",
     "rm": "--remove-account",
+    "disable": "--disable-account",
+    "enable": "--enable-account",
     "export": "--export",
     "import": "--import",
     "purge": "--purge",
@@ -125,8 +135,10 @@ Examples:
     )
     parser.add_argument(
         "account",
+        nargs="?",
         metavar="NUM|EMAIL",
-        help="Account to run (number or email)",
+        help="Account to run (number or email). Omit to use the current "
+        "directory's mapping (see `cswap map`).",
     )
     parser.add_argument(
         "--no-share",
@@ -158,20 +170,236 @@ Examples:
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
-
-        if sys.platform != "win32":
-            if os.geteuid() == 0 and not switcher._is_running_in_container():
-                error("Error: Do not run this script as root (unless running in a container)")
-                sys.exit(1)
+        _guard_root(switcher)
 
         from claude_swap.session import SessionManager
 
-        SessionManager(switcher).run(
-            args.account,
-            tail,
-            share=not args.no_share,
-            share_history=args.share_history,
-        )
+        manager = SessionManager(switcher)
+
+        if args.account is not None:
+            manager.run(
+                args.account,
+                tail,
+                share=not args.no_share,
+                share_history=args.share_history,
+            )
+            return  # only reachable in tests where exec/exit is mocked
+
+        # No account given: resolve from the current directory's mapping.
+        slot, email = switcher.slot_for_directory(os.getcwd())
+        if slot is not None:
+            manager.run(
+                slot,
+                tail,
+                share=not args.no_share,
+                share_history=args.share_history,
+            )
+            return  # only reachable in tests
+        if email is not None:
+            warning(
+                f"Mapped account {email} no longer exists — "
+                "launching the default account."
+            )
+        else:
+            print(
+                dimmed(
+                    f"No account mapped for {os.getcwd()} — "
+                    "launching the default account."
+                )
+            )
+        manager.exec_default(tail)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
+    """Refuse to run as root outside a container (shared by run/map/unmap)."""
+    if sys.platform != "win32":
+        if os.geteuid() == 0 and not switcher._is_running_in_container():
+            error("Error: Do not run this script as root (unless running in a container)")
+            sys.exit(1)
+
+
+def _map_command(argv: list[str]) -> None:
+    """Handle `cswap map [NUM|EMAIL] [PATH]`.
+
+    With no NUM|EMAIL, lists all mappings. Otherwise maps PATH (default: the
+    current directory) to the given account. Pre-dispatched before the main
+    parser for the same reason as `run` (the main parser's required
+    mutually-exclusive group can't hold a positional subcommand).
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap map",
+        description=(
+            "Map a stored account to a directory so `cswap run` (with no "
+            "account) auto-launches it there. With no arguments, lists all "
+            "mappings."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap map 2 ~/work/client-app
+  cswap map user@example.com          # map the current directory
+  cswap map                           # list all mappings
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to map (number or email). Omit to list mappings.",
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        metavar="PATH",
+        help="Directory to map (default: current directory)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            switcher.list_mappings()
+            return
+
+        from claude_swap.mappings import MappingStore, normalize_path
+
+        store = MappingStore(switcher.backup_dir)
+        account_num, email, org_uuid = switcher.resolve_account(args.account)
+        target = args.path or os.getcwd()
+        if not os.path.isdir(target):
+            warning(f"Warning: {target} is not an existing directory (mapping it anyway)")
+        previous = store.get(target)
+        store.set(target, email, org_uuid)
+
+        shown = normalize_path(target)
+        if previous and previous.get("email") != email:
+            prev_email = previous.get("email")
+            print(
+                f"{accent('Mapped')} {shown} → Account-{account_num} ({email}) "
+                f"{muted(f'(was {prev_email})')}"
+            )
+        else:
+            print(f"{accent('Mapped')} {shown} → Account-{account_num} ({email})")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _unmap_command(argv: list[str]) -> None:
+    """Handle `cswap unmap [PATH]` — remove a directory→account mapping."""
+    parser = argparse.ArgumentParser(
+        prog="cswap unmap",
+        description="Remove a directory → account mapping (default: current directory).",
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        metavar="PATH",
+        help="Directory to unmap (default: current directory)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        from claude_swap.mappings import MappingStore, normalize_path
+
+        store = MappingStore(switcher.backup_dir)
+        target = args.path or os.getcwd()
+        shown = normalize_path(target)
+        if store.remove(target):
+            print(f"{accent('Unmapped')} {shown}")
+        else:
+            print(dimmed(f"No mapping for {shown}"))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _alias_command(argv: list[str]) -> None:
+    """Handle `cswap alias [NUM|EMAIL] [NAME] [--unset]`.
+
+    With no arguments, lists all aliases. Otherwise sets (or, with --unset,
+    removes) the alias for the given account. Pre-dispatched before the main
+    parser for the same reason as `map` (the main parser's required
+    mutually-exclusive group can't hold a positional subcommand).
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap alias",
+        description=(
+            "Set, remove, or list a short display alias for an account. "
+            "Once set, the alias can be used anywhere an account number or "
+            "email is accepted (switch, remove, run, map)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap alias 2 dev
+  cswap alias user@example.com dev
+  cswap alias 2 --unset
+  cswap alias                         # list all aliases
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to alias (number or email). Omit to list aliases.",
+    )
+    parser.add_argument(
+        "alias_name",
+        nargs="?",
+        metavar="NAME",
+        help="Alias to set (letters, digits, ., -, _; not purely numeric).",
+    )
+    parser.add_argument("--unset", action="store_true", help="Remove the account's alias")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.alias_name:
+        parser.error("--unset does not take a NAME argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+    if args.account is not None and not args.unset and not args.alias_name:
+        parser.error("NAME is required (or pass --unset to remove the alias)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            rows = switcher.list_aliases()
+            if not rows:
+                print(dimmed("No aliases set"))
+                return
+            print(bolded("Aliases:"))
+            for num, alias_name, email in rows:
+                print(f"  {num}: {alias_name} {muted(f'({email})')}")
+            return
+
+        if args.unset:
+            account_num = switcher.unset_alias(args.account)
+            print(f"{accent('Removed alias')} for Account {account_num}")
+        else:
+            account_num, normalized = switcher.set_alias(args.account, args.alias_name)
+            print(f"{accent('Set alias')} '{normalized}' for Account {account_num}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -211,6 +439,7 @@ Exit codes with --once:
 Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -248,6 +477,16 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="SECONDS",
         help="Minimum time between proactive switches (default 300)",
+    )
+    parser.add_argument(
+        "--model",
+        metavar="NAMES",
+        help=(
+            "Also switch when a per-model weekly limit is hit, not just the "
+            "account-wide 5h/7d windows. One name or a comma-separated list "
+            "(e.g. Fable, Opus, Sonnet, Haiku, or 'Fable,Opus'), or 'all' "
+            "for every per-model window an account reports"
+        ),
     )
     parser.add_argument(
         "--include-api-key-accounts",
@@ -517,6 +756,15 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "map":
+        _map_command(argv[1:])
+        return
+    if argv and argv[0] == "unmap":
+        _unmap_command(argv[1:])
+        return
+    if argv and argv[0] == "alias":
+        _alias_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -543,7 +791,16 @@ Commands:
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
+  %(prog)s disable <num|email>        hold an account out of auto-rotation
+  %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
+  %(prog)s run                        run the current dir's mapped account
+  %(prog)s map <num|email> [path]     map a directory to an account
+  %(prog)s map                        list directory mappings
+  %(prog)s unmap [path]               remove a directory mapping
+  %(prog)s alias <num|email> <name>   set a short alias for an account
+  %(prog)s alias <num|email> --unset  remove an account's alias
+  %(prog)s alias                      list all aliases
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
@@ -606,6 +863,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--model",
+        metavar="NAMES",
+        help=(
+            "With 'switch --strategy': also count these models' per-model "
+            "weekly limits when comparing accounts (comma-separated display "
+            "names, or 'all'). Defaults to the autoswitch.model setting"
+        ),
+    )
+    parser.add_argument(
         "--slot",
         type=int,
         metavar="NUM",
@@ -625,6 +891,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--account",
         metavar="NUM|EMAIL",
         help="Limit export to one account (use with 'export')",
+    )
+    parser.add_argument(
+        "--alias",
+        metavar="NAME",
+        help="Set a short display alias for the account (use with 'add')",
     )
     parser.add_argument(
         "--force",
@@ -655,6 +926,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     )
     group.add_argument(
         "--remove-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--disable-account",
+        metavar="NUM|EMAIL",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--enable-account",
         metavar="NUM|EMAIL",
         help=argparse.SUPPRESS,
     )
@@ -739,6 +1020,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.menubar
         or args.upgrade
         or args.remove_account is not None
+        or args.disable_account is not None
+        or args.enable_account is not None
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
@@ -760,6 +1043,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
 
+    if args.model is not None and args.strategy is None:
+        # Meaningless on a direct-target switch or plain rotation — nothing
+        # usage-aware reads it there, so reject loudly rather than ignore.
+        parser.error(
+            "--model can only be used with 'switch --strategy best' or "
+            "'switch --strategy next-available'"
+        )
+
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
@@ -768,6 +1059,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
+
+    if args.alias is not None and not args.add_account:
+        parser.error("--alias can only be used with 'add'")
 
     if args.force and not (args.import_ or args.switch_to):
         parser.error("--force can only be used with 'import' or 'switch <num|email>'")
@@ -803,7 +1097,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 sys.exit(1)
 
         if args.add_account:
-            switcher.add_account(slot=args.slot)
+            switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
             switcher.add_account_from_token(
                 token=args.add_token,
@@ -812,13 +1106,37 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             )
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
+        elif args.disable_account is not None:
+            switcher.set_account_disabled(args.disable_account, True)
+        elif args.enable_account is not None:
+            switcher.set_account_disabled(args.enable_account, False)
         elif args.list:
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
                 json_output=args.json,
             )
         elif args.switch:
-            payload = switcher.switch(strategy=args.strategy, json_output=args.json)
+            from claude_swap.settings import load_settings, parse_model_names
+
+            # Only the usage-aware strategies read model limits: --model wins;
+            # otherwise the persistent autoswitch.model setting applies
+            # (announced by switch(), never silently).
+            if args.strategy is None:
+                models, model_source = (), None
+            elif args.model is not None:
+                models, model_source = parse_model_names(args.model), "cli"
+            else:
+                models = parse_model_names(load_settings(switcher.backup_dir).model)
+                model_source = "autoswitch.model" if models else None
+            payload = switcher.switch(
+                strategy=args.strategy,
+                json_output=args.json,
+                models=models,
+                model_source=model_source,
+            )
+            if payload is not None and models:
+                payload["models"] = list(models)
+                payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force

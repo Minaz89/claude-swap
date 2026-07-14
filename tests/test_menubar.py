@@ -127,6 +127,16 @@ def test_format_account_label():
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
+def test_format_account_label_with_alias():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
+    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_disabled_marker():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
+    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
+
+
 # --- usage logging -------------------------------------------------------------
 
 def test_format_usage_log_full():
@@ -171,6 +181,11 @@ def test_format_title_name_and_5h():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
 
 
+def test_format_title_prefers_alias_over_local_part():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s, alias="dev") == "⇄ dev"
+
+
 def test_format_title_name_only_when_pct_off():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc"
@@ -199,6 +214,30 @@ def test_format_title_both_windows_with_name():
 def test_format_title_icon_only_when_off():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄"
+
+
+def test_format_title_scoped_appends_model_limits():
+    # title_pct="off" + title_scoped gives a title tracking only the scoped model
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_scoped=True)
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ loc · Fable 55%"
+
+
+def test_format_title_scoped_after_windows_multiple_models():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both", title_scoped=True)
+    usage = {
+        **_USAGE,
+        "scoped": [{"name": "Fable", "pct": 55.0}, {"name": "Opus", "pct": 7.0}],
+    }
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 42% · 18% · Fable 55% · Opus 7%"
+
+
+def test_format_title_scoped_off_by_default():
+    # default settings ignore scoped windows entirely
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert not s.title_scoped
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄"
 
 
 def test_format_title_icon_only_when_no_active_account():
@@ -308,11 +347,13 @@ class _FakeEntry:
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage):
+    def __init__(self, number, email, is_active, usage, alias="", disabled=False):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
+        self.alias = alias
+        self.disabled = disabled
 
 
 class _FakeSnap:
@@ -335,16 +376,17 @@ def test_adapt_snapshot_shape_and_active_selection():
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
         _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg)),
-        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY)),
+        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
-    # (num, email, is_active, display_usage, last_good)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg)
-    # sentinel account: display is the human note, last_good is None
+    assert snap["active_alias"] == ""
+    # (num, email, is_active, display_usage, last_good, alias, disabled)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False)
+    # sentinel account: display is the human note, last_good is None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None,
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True,
     )
 
 

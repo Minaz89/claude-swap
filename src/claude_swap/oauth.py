@@ -7,7 +7,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -287,15 +287,17 @@ def format_reset(resets_at: str) -> tuple[str, str]:
     else:
         countdown = f"{minutes}m"
 
-    reset_local = reset_utc.astimezone()
-    now_local = now.astimezone()
-    if reset_local.date() == now_local.date():
-        time_str = reset_local.strftime("%H:%M")
-    else:
-        day = str(reset_local.day)
-        time_str = reset_local.strftime(f"%b {day} %H:%M")
+    return countdown, reset_clock_string(reset_utc, now)
 
-    return countdown, time_str
+
+def reset_clock_string(reset_utc: datetime, now_utc: datetime) -> str:
+    """Absolute reset time in local time: "20:39" same-day, else "Jul 5 08:59"."""
+    reset_local = reset_utc.astimezone()
+    now_local = now_utc.astimezone()
+    if reset_local.date() == now_local.date():
+        return reset_local.strftime("%H:%M")
+    day = str(reset_local.day)
+    return reset_local.strftime(f"%b {day} %H:%M")
 
 
 def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
@@ -371,11 +373,11 @@ def _log_usage_failure(
     question without a second ask)."""
     where = f" {context}" if context else ""
     cause = kind if retry_after_s is None else f"{kind}, retry-after {retry_after_s:.0f}s"
-    if kind == "http-429" and retry_after_s:
-        # The burst rule needs ~5 rapid requests on one account to trip; cswap
-        # sends at most one per account per pass, so state the verified fact
-        # and let the user look for the real poller.
-        cause += " (burst block — cswap's own polling cannot trigger this)"
+    if kind == "http-429":
+        # The endpoint budgets requests per access token (see poll_policy):
+        # cumulative polling across cswap surfaces can saturate it, and
+        # backoff plus the adaptive cadence are the recovery.
+        cause += " (per-token usage budget reached; backing off)"
     _logger.warning("Usage fetch failed%s: %s", where, cause)
     _logger.debug("Usage fetch failure detail%s: %r", where, e)
 
@@ -455,23 +457,60 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
-def account_headroom(usage: dict | None) -> float | None:
-    """Remaining percentage before this account hits a rate-limit window.
+def relevant_windows(
+    usage: dict | None, models: Sequence[str] = ()
+) -> list[tuple[str, float, str | None]]:
+    """Every ``(label, pct, resets_at)`` window that gates this account.
 
-    Considers only the 5-hour and 7-day utilization windows — the two that
-    actually gate requests. ``spend`` (pay-as-you-go extra-usage credits) is a
-    separate axis and is deliberately ignored. Returns the headroom of the
-    *binding* window (``100 - max(pct)``), so ``<= 0`` means the account is at
-    or over a limit. Returns ``None`` when usage is unavailable or carries no
-    window data, which callers treat as "unknown" (never auto-skipped).
+    Always the 5-hour ("5h") and 7-day ("7d") windows. When ``models`` is
+    non-empty, each named per-model weekly ``scoped`` window is included too
+    (matched case-insensitively on display name, e.g. "Fable"; the sentinel
+    ``all`` matches every scoped window the account reports). The single
+    canonical window source for decisions, scheduling, and reset math — so a
+    window that binds a decision can never be invisible to the scheduler.
+    ``spend`` (pay-as-you-go extra-usage credits) is a separate axis and is
+    deliberately excluded. ``resets_at`` is the ISO string as fetched, or
+    ``None`` when the API sent none.
     """
     if not isinstance(usage, dict):
-        return None
-    pcts = [
-        window["pct"]
-        for window in (usage.get("five_hour"), usage.get("seven_day"))
-        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float))
-    ]
+        return []
+    windows: list[tuple[str, float, str | None]] = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = usage.get(key)
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
+            windows.append((label, float(window["pct"]), window.get("resets_at")))
+    if models:
+        wanted = {m.lower() for m in models}
+        match_all = "all" in wanted
+        scoped = usage.get("scoped")
+        if isinstance(scoped, list):
+            for s in scoped:
+                if (
+                    isinstance(s, dict)
+                    and isinstance(s.get("pct"), (int, float))
+                    and isinstance(s.get("name"), str)
+                    and (match_all or s["name"].lower() in wanted)
+                ):
+                    windows.append((s["name"], float(s["pct"]), s.get("resets_at")))
+    return windows
+
+
+def account_headroom(
+    usage: dict | None, models: Sequence[str] = ()
+) -> float | None:
+    """Remaining percentage before this account hits a rate-limit window.
+
+    Considers the 5-hour and 7-day utilization windows — the two that always
+    gate requests. When ``models`` is non-empty, each named per-model weekly
+    ``scoped`` window (see :func:`relevant_windows`) is folded in too: a model
+    maxed at 100% blocks that model's work even with 5h/7d headroom, so for
+    someone pinned to that model it binds just as hard. Returns the headroom
+    of the *binding* window (``100 - max(pct)``), so ``<= 0`` means the
+    account is at or over a limit. Returns ``None`` when usage is unavailable
+    or carries no window data, which callers treat as "unknown" (never
+    auto-skipped).
+    """
+    pcts = [pct for _, pct, _ in relevant_windows(usage, models)]
     if not pcts:
         return None
     return 100.0 - max(pcts)

@@ -36,16 +36,21 @@ import random
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth
+from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json
+from claude_swap.poll_policy import (
+    ESCALATION_MARGIN_PCT,
+    RESET_SLACK_S,
+    binding_pct,
+)
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate
 
@@ -59,10 +64,9 @@ _logger = logging.getLogger("claude-swap")
 # expired" re-read holds with margin after our swap.
 FRESHEN_BUFFER_MS = 10 * 60 * 1000
 
-# Sleep caps around a known quota reset: a little slack past the reset, and
-# never trust one long sleep (laptops suspend, clocks drift) — cap and
-# re-evaluate.
-RESET_SLACK_S = 60.0
+# Sleep caps around a known quota reset (RESET_SLACK_S lives in poll_policy
+# with the rest of the cadence numbers): never trust one long sleep (laptops
+# suspend, clocks drift) — cap and re-evaluate.
 MAX_SLEEP_S = 6 * 3600.0
 NO_RESET_FALLBACK_S = 300.0
 
@@ -73,30 +77,15 @@ NO_RESET_FALLBACK_S = 300.0
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
 
-# Adaptive scheduler: the baseline request volume is O(1) per tick — the
+# Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
-# every account in parallel. Candidates far from mattering are served stale
-# from the usage store. The engine escalates to a full refresh only when a
-# switch could actually be near: active utilization within this margin of the
-# threshold, or active usage unknown (failover needs fresh candidate data).
-ESCALATION_MARGIN_PCT = 15.0
-# A candidate whose binding pct moved at least this much between polls is
-# being used elsewhere (another PC / session mode) → poll it more closely;
-# an unmoved one backs off, up to the cap.
-MOVEMENT_DELTA_PCT = 1.0
-CANDIDATE_MAX_INTERVAL_S = 600.0
-# The active account's cadence relaxes with distance (in utilization points)
-# to the escalation band, because burn rate is absolute: >50 pts below the
-# band → this hard cap (never slower); >25 pts → 2× the interval; else every
-# tick. Distance-based rather than absolute pct so an adjusted threshold
-# keeps the same safety margin (at threshold 50 the cap is simply never
-# reachable). The cap stays under STALE_OK_S so a relaxed active never loses
-# decision trust, and the worst plausible burn (~5%/min, heavy subagent use)
-# moves +15 pts between capped polls — still ≥35 pts from the band, and band
-# entry is seen at most one poll late, absorbed by ESCALATION_MARGIN_PCT +
-# hysteresis.
-ACTIVE_MAX_INTERVAL_S = 180.0
-ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× this
+# every account in parallel, and the per-account cadence itself (movement,
+# threshold distance, urgent mode, 429 recovery) lives in poll_policy, is
+# persisted in the usage store by whichever collector fetched, and is shared
+# by every surface. The engine escalates to a full candidate refresh only
+# when a switch could actually be near: active utilization within
+# ESCALATION_MARGIN_PCT of the threshold, or active usage unknown (failover
+# needs fresh candidate data).
 
 
 def _now_iso() -> str:
@@ -105,6 +94,16 @@ def _now_iso() -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def pct_label(value: float) -> str:
+    """A percentage for display, as configured: 85.555555 stays itself
+    (never a rounded "85.5556") and 99.9 never becomes a lying "100" the
+    way ``.0f`` renders it. Ten significant digits still absorb IEEE float
+    noise (~15th digit) in computed utilizations (100.0 - headroom).
+    Displayed comparisons must format BOTH sides with this helper — mixing
+    formatters can render an impossible "85.5556% < 85.555555%"."""
+    return f"{value:.10g}"
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +143,11 @@ class PollEvent(AutoSwitchEvent):
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
+    # account number → ordered window label → utilization pct ("5h", "7d",
+    # then scoped model display names). Additive field: the binding pct alone
+    # (e.g. "89%") hides which window binds — #115 was reported off that
+    # ambiguity.
+    windows: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -153,9 +157,14 @@ class PollEvent(AutoSwitchEvent):
         }
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
+        if self.windows:
+            fields["windowsPct"] = self.windows
         return fields
 
     def _describe(self, num: str) -> str:
+        wins = self.windows.get(num)
+        if wins:
+            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
@@ -180,7 +189,7 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {self.threshold:.0f}%){tail}"
+            f"(switch at {pct_label(self.threshold)}%){tail}"
         )
 
 
@@ -300,6 +309,22 @@ class ErrorEvent(AutoSwitchEvent):
         return f"error: {self.message}" + (" (will retry)" if self.transient else "")
 
 
+@dataclass(frozen=True)
+class ConfigWarningEvent(AutoSwitchEvent):
+    """A configuration value is syntactically fine but provably inert (e.g.
+    an ``autoswitch.model`` name no account reports). Not an error: the
+    engine keeps running on the axes that do exist."""
+
+    kind: ClassVar[str] = "config-warning"
+    message: str
+
+    def _fields(self) -> dict:
+        return {"message": self.message}
+
+    def human(self) -> str:
+        return f"warning: {self.message}"
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -322,55 +347,26 @@ class TickOutcome(enum.Enum):
 _refresh_fingerprint = oauth.credential_fingerprint
 
 
-def binding_pct(usage: dict | None) -> float | None:
-    """Utilization of the binding (higher) 5h/7d window, or None."""
-    headroom = oauth.account_headroom(usage)
-    return None if headroom is None else 100.0 - headroom
+def _window_pcts(
+    usage: dict | None, models: tuple[str, ...] = ()
+) -> dict[str, float]:
+    """Ordered window label → pct: "5h", "7d", then configured scoped names.
+
+    Deliberately restricted to the windows the *decision* reads (same
+    ``models`` filter): showing an unconfigured scoped window at 100% next
+    to a switch onto that account would look like a bug, when the engine
+    correctly ignored it. Full per-model usage lives in ``cswap list``.
+    """
+    return {
+        name: pct for name, pct, _ in oauth.relevant_windows(usage, models)
+    }
 
 
-def _limiting_reset_ts(usage: dict | None) -> float | None:
-    """Epoch when the last of the ≥100% windows resets (account usable again)."""
-    if not isinstance(usage, dict):
-        return None
-    latest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
-            continue
-        pct = window.get("pct")
-        if not isinstance(pct, (int, float)) or pct < 100.0:
-            continue
-        ts = _window_reset_ts(window)
-        if ts is not None and (latest is None or ts > latest):
-            latest = ts
-    return latest
-
-
-def _earliest_future_reset_ts(usage: dict | None, now: float) -> float | None:
-    """Epoch of the next window reset still ahead of ``now``, any utilization."""
-    if not isinstance(usage, dict):
-        return None
-    earliest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
-            continue
-        ts = _window_reset_ts(window)
-        if ts is not None and ts > now and (earliest is None or ts < earliest):
-            earliest = ts
-    return earliest
-
-
-def _window_reset_ts(window: dict) -> float | None:
-    resets_at = window.get("resets_at")
-    if not resets_at:
-        return None
-    try:
-        return datetime.fromisoformat(
-            str(resets_at).replace("Z", "+00:00")
-        ).timestamp()
-    except ValueError:
-        return None
+# Reset math moved to poll_policy with the cadence numbers; aliased for the
+# engine's sleep scheduling and the test suite.
+_limiting_reset_ts = poll_policy.limiting_reset_ts
+_earliest_future_reset_ts = poll_policy.earliest_future_reset_ts
+_parse_reset_ts = poll_policy.parse_reset_ts
 
 
 def _ref(number: str, email: str) -> dict:
@@ -397,11 +393,24 @@ class AutoSwitchEngine:
     ):
         self.switcher = switcher
         self.settings = settings
+        # Model(s) whose per-model weekly limit also binds the switch decision
+        # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
+        # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
+        # pass everywhere usage windows are read — decisions, cadence, and
+        # reset scheduling must all see the same axes.
+        self._models = parse_model_names(settings.model)
+        # Poll plans written by the collector must key on the same threshold/
+        # models the engine decides with (CLI overrides included), not on
+        # whatever the settings file happens to say.
+        switcher.set_poll_policy_inputs(settings.threshold, self._models)
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
         self._stop = threading.Event()
+        # Cuts the current inter-tick sleep short (a session threshold change
+        # from the TUI should show a fresh decision now, not next interval).
+        self._wake = threading.Event()
         self._unhealthy_ticks = 0
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
@@ -414,6 +423,10 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
+        # warned) on the first tick where every relevant account has readable
+        # usage — adaptive polling legitimately leaves gaps before that.
+        self._model_check_done = not self._models
 
     # -- state file ---------------------------------------------------------
 
@@ -652,7 +665,9 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        entries, usage, headroom = self._collect_scheduled_usage(current, quarantined)
+        entries, usage, headroom = self._collect_scheduled_usage(
+            current, quarantined, threshold=settings.threshold
+        )
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -663,8 +678,18 @@ class AutoSwitchEngine:
                     for num, entry in entries.items()
                     if usage.get(num) is None and entry.last_error
                 },
+                windows={
+                    num: pcts
+                    for num, value in usage.items()
+                    if (pcts := _window_pcts(
+                        value if isinstance(value, dict) else None, self._models
+                    ))
+                },
             )
         )
+
+        if not self._model_check_done:
+            self._check_model_names(quarantined, usage)
 
         if (
             self.switcher.account_kind_for(current) == "api_key"
@@ -687,7 +712,12 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="below-threshold",
-                        detail=f"{utilization:.0f}% < {settings.threshold:.0f}%",
+                        # Both sides through pct_label: .0f utilization could
+                        # display an impossible "100% < 99.9%".
+                        detail=(
+                            f"{pct_label(utilization)}% < "
+                            f"{pct_label(settings.threshold)}%"
+                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
@@ -765,7 +795,6 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        hysteresis_bar = settings.threshold - settings.hysteresis_pct
         qualifying: list[tuple[float, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -775,15 +804,19 @@ class AutoSwitchEngine:
             any_known = True
             if h <= 0:
                 continue  # itself at its limit — never a target
-            if trigger == "proactive":
+            if trigger == "proactive" and active_headroom is not None:
                 # Hysteresis guards only the proactive case: two accounts
-                # hovering at the line must not ping-pong. At-limit and
-                # failover are escapes — any account with real headroom
-                # beats a blocked or dead one (and you can't flap back onto
-                # an account at 100%).
-                if (100.0 - h) > hysteresis_bar:
+                # hovering at the line must not ping-pong. The gate is
+                # relative — the candidate must beat the active account by
+                # the full margin (a one-way move like 99%→89% qualifies;
+                # near-line pairs can't flap back) — and the landing must be
+                # healthy: an account at/over the threshold would re-trigger
+                # on the very next tick. At-limit and failover are escapes —
+                # any account with real headroom beats a blocked or dead one
+                # (and you can't flap back onto an account at 100%).
+                if (100.0 - h) >= settings.threshold:
                     continue
-                if active_headroom is not None and h <= active_headroom:
+                if h - active_headroom < settings.hysteresis_pct:
                     continue  # not provably better than where we are
             qualifying.append((h, num))
         # Best headroom first; list order (sequence order) breaks ties.
@@ -805,7 +838,7 @@ class AutoSwitchEngine:
             # "All exhausted" (and its hours-long reset sleep) only when it's
             # literally true: every candidate's usage is known and at its
             # limit. A candidate that merely failed the proactive hysteresis
-            # bar, or one whose usage is unreadable this tick, can become
+            # gate, or one whose usage is unreadable this tick, can become
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
             candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
@@ -817,14 +850,15 @@ class AutoSwitchEngine:
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
                         detail=(
-                            "candidates are too close to the line or their "
-                            "usage is unreadable this tick"
+                            "no candidate is below the threshold and better "
+                            "than the active account by the hysteresis "
+                            "margin, or usage is unreadable this tick"
                         ),
                     )
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
-            earliest = self._earliest_reset(usage)
+            earliest = self._earliest_recovery(usage)
             if earliest is not None:
                 self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
             self._emit(
@@ -878,26 +912,31 @@ class AutoSwitchEngine:
     # -- adaptive usage scheduling ---------------------------------------------
 
     def _collect_scheduled_usage(
-        self, current: str, quarantined: set[str] = frozenset()
+        self,
+        current: str,
+        quarantined: set[str] = frozenset(),
+        *,
+        threshold: float | None = None,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
-        Phase A fetches the active account (at its distance-to-threshold
-        cadence — every tick only near the band, see
-        :meth:`_active_poll_interval_s`) plus ONE due candidate (the one
-        with the stalest data — never-fetched first, then oldest fetch);
-        everyone else is served from the usage store. Phase B refetches ALL
-        candidates and recomputes before any switch decision when a switch
-        could be near: active utilization within ``ESCALATION_MARGIN_PCT`` of
-        the threshold, or active usage unknown (failover must not run on
-        stale candidate data). Candidate selection never runs on the
-        pre-escalation snapshot.
+        Phase A fetches the active account (when its persisted poll plan says
+        it is due — poll_policy's urgent mode is what tightens that cadence
+        near the band) plus ONE due candidate (the one with the stalest data
+        — never-fetched first, then oldest fetch); everyone else is served
+        from the usage store. Phase B refetches ALL candidates and recomputes
+        before any switch decision when a switch could be near: active
+        utilization within ``ESCALATION_MARGIN_PCT`` of the threshold, or
+        active usage unknown (failover must not run on stale candidate data).
+        Candidate selection never runs on the pre-escalation snapshot.
 
         Stalest-first needs no rotation cursor: it reads the persisted store,
         so the loop and cron-driven ``--once`` runs schedule identically.
         Backoff (``backoffUntil``) is enforced by the collector even for the
         active account — a Retry-After must never be defeated — and during an
         idle-hold no candidate is polled at all (slow crawl for everything).
+        Adapted cadences are persisted by the collector itself after each
+        fetch (shared with every other surface), not by the engine.
 
         Returns ``(entries, usage, headroom)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
@@ -914,10 +953,35 @@ class AutoSwitchEngine:
         pre = self.switcher.usage_entries_by_account(fetch=set())
         plan: set[str] = set()
         active_pre = pre.get(current)
+        # The active account is nominated when never fetched, poll-due per its
+        # persisted plan, or (no plan yet) past the normal cadence floor. The
+        # collector's reserve() honors due-ness even inside the serve TTL, so
+        # an urgent plan (60s while burning near the band) actually fetches.
+        # A candidate-style plan (slower than any active plan can be) left
+        # over from a role change the switcher never saw (e.g. a manual
+        # login) is overridden past the active age cap — but an exhausted
+        # account stays parked at its reset: its numbers cannot move until
+        # then, and the passed reset itself makes the plan due.
+        stale_candidate_plan = (
+            active_pre is not None
+            and active_pre.age_s is not None
+            and active_pre.age_s >= poll_policy.ACTIVE_MAX_INTERVAL_S
+            and (active_pre.poll_interval_s or 0.0)
+            > poll_policy.ACTIVE_MAX_INTERVAL_S
+            and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
+        )
         if (
             active_pre is None
             or active_pre.age_s is None
-            or active_pre.age_s >= self._active_poll_interval_s(active_pre)
+            or stale_candidate_plan
+            or (
+                active_pre.next_poll_at is not None
+                and now >= active_pre.next_poll_at
+            )
+            or (
+                active_pre.next_poll_at is None
+                and active_pre.age_s >= poll_policy.MIN_INTERVAL_S
+            )
         ):
             plan.add(current)
         if self._idle_hold_since is None:
@@ -929,14 +993,17 @@ class AutoSwitchEngine:
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
-            active_value if isinstance(active_value, dict) else None
+            active_value if isinstance(active_value, dict) else None, self._models
         )
+        # The caller's tick-snapshotted threshold, so one tick fetches and
+        # decides on the same value even if apply_threshold() lands mid-tick.
+        if threshold is None:
+            threshold = self.settings.threshold
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
-                and 100.0 - active_headroom
-                >= self.settings.threshold - ESCALATION_MARGIN_PCT
+                and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
             )
         )
         if escalate:
@@ -946,82 +1013,12 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         headroom = {
-            num: oauth.account_headroom(value if isinstance(value, dict) else None)
+            num: oauth.account_headroom(
+                value if isinstance(value, dict) else None, self._models
+            )
             for num, value in usage.items()
         }
-        if not self.dry_run:
-            self._update_poll_plans(candidates, pre, entries, now)
         return entries, usage, headroom
-
-    def _active_poll_interval_s(self, entry) -> float:
-        """Stepwise active cadence by distance to the escalation band.
-
-        Unknown utilization or in-band → every tick (the at-limit escape and
-        failover paths must never wait); more than ``ACTIVE_RELAX_DISTANCE_PCT``
-        points below the band → 2× the engine interval; more than twice that
-        → ``ACTIVE_MAX_INTERVAL_S``. (At the default threshold 90 these are
-        the <50% / <25% utilization steps.) Derived per tick from the stored
-        entry — no persisted state, and failure backoff / idle-hold /
-        escalation are enforced elsewhere and unaffected.
-        """
-        interval = float(self.settings.interval_seconds)
-        pct = binding_pct(entry.last_good)
-        if pct is None:
-            return interval
-        distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
-        if distance > 2 * ACTIVE_RELAX_DISTANCE_PCT:
-            tier = ACTIVE_MAX_INTERVAL_S
-        elif distance > ACTIVE_RELAX_DISTANCE_PCT:
-            tier = 2.0 * interval
-        else:
-            return interval
-        return min(tier, ACTIVE_MAX_INTERVAL_S)
-
-    def _update_poll_plans(
-        self, candidates: list[str], pre: dict, post: dict, now: float
-    ) -> None:
-        """Adapt each just-fetched candidate's poll cadence, persisted in the
-        store (survives ``--once`` engine restarts).
-
-        Movement (binding pct changed ≥ ``MOVEMENT_DELTA_PCT`` since its
-        previous poll — someone is using it elsewhere) halves the interval,
-        floored at the engine interval; no movement backs it off ×1.5 up to
-        ``CANDIDATE_MAX_INTERVAL_S``. A poll is never scheduled later than the
-        candidate's next window reset (stored usage is obsolete the moment a
-        window rolls over — a 95% candidate is really ~0% after its reset).
-        A candidate at its limit skips straight to its window reset
-        (``nextPollAt`` only — the learned interval is kept for when it
-        comes back).
-        """
-        plans: dict[str, tuple[float | None, float | None]] = {}
-        for num in candidates:
-            before, after = pre.get(num), post.get(num)
-            if before is None or after is None or after.sentinel is not None:
-                continue
-            if after.fetched_at is None or after.fetched_at == before.fetched_at:
-                continue  # not fetched this pass
-            base = before.poll_interval_s or self.settings.interval_seconds
-            prev_pct = binding_pct(before.last_good)
-            new_pct = binding_pct(after.last_good)
-            if prev_pct is None or new_pct is None:
-                interval = self.settings.interval_seconds
-            elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
-                interval = max(self.settings.interval_seconds, base / 2)
-            else:
-                interval = min(CANDIDATE_MAX_INTERVAL_S, base * 1.5)
-            next_poll = now + interval
-            headroom = oauth.account_headroom(after.last_good)
-            if headroom is not None and headroom <= 0:
-                reset_ts = _limiting_reset_ts(after.last_good)
-                if reset_ts is not None and reset_ts > next_poll:
-                    next_poll = reset_ts
-            else:
-                reset_ts = _earliest_future_reset_ts(after.last_good, now)
-                if reset_ts is not None:
-                    next_poll = min(next_poll, reset_ts + RESET_SLACK_S)
-            plans[num] = (next_poll, interval)
-        if plans:
-            self.switcher.set_usage_poll_plan(plans)
 
     def _perform(self, number: str, email: str, trigger: str) -> TickOutcome:
         if self.dry_run:
@@ -1082,24 +1079,84 @@ class AutoSwitchEngine:
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
 
-    @staticmethod
-    def _earliest_reset(usage: dict[str, dict | str | None]) -> datetime | None:
-        """Earliest known window reset across all accounts (UTC)."""
-        earliest: datetime | None = None
-        for entry in usage.values():
-            if not isinstance(entry, dict):
+    def _check_model_names(
+        self, quarantined: set[str], usage: dict[str, dict | str | None]
+    ) -> None:
+        """One-shot ``autoswitch.model`` typo guard.
+
+        A configured name that no account reports means the filter looks
+        active while gating nothing. That's only provable once every
+        relevant oauth account has readable usage this tick — adaptive
+        polling legitimately leaves gaps before that — and never worth a
+        forced refresh of its own.
+        """
+        wanted = {m.lower(): m for m in self._models if m.lower() != "all"}
+        if not wanted:
+            self._model_check_done = True  # bare "all" needs no name match
+            return
+        relevant = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n not in quarantined
+            and self.switcher.account_kind_for(n) != "api_key"
+        ]
+        values = [usage.get(n) for n in relevant]
+        readable = [v for v in values if isinstance(v, dict)]
+        if not readable or len(readable) != len(values):
+            return  # not every account observed yet — re-check next tick
+        seen = {
+            s["name"].lower()
+            for v in readable
+            for s in (v.get("scoped") or [])
+            if isinstance(s, dict) and isinstance(s.get("name"), str)
+        }
+        self._model_check_done = True
+        missing = [name for low, name in wanted.items() if low not in seen]
+        if missing:
+            self._emit(
+                ConfigWarningEvent(
+                    message=(
+                        f"autoswitch.model: {', '.join(missing)} matches no "
+                        "account's usage windows — only the 5h/7d limits are "
+                        "being watched for it (typo?)"
+                    )
+                )
+            )
+
+    def _earliest_recovery(
+        self, usage: dict[str, dict | str | None]
+    ) -> datetime | None:
+        """Earliest moment any account becomes usable again (UTC), or None
+        when that moment can't be proven.
+
+        Per account that's the *latest* reset among its ≥100% relevant
+        windows — an account blocked on both 5h and a scoped weekly limit
+        isn't usable when the 5h rolls over — then the minimum across
+        accounts, the active one included (its recovery also ends the
+        blocked state). A blocked account whose exhausted windows carry no
+        reset time at all could recover at any moment, so it makes the whole
+        answer unprovable: return None and let the bounded blocked-cadence
+        fallback re-check, rather than sleeping toward another account's
+        later known reset."""
+        earliest: float | None = None
+        for value in usage.values():
+            if not isinstance(value, dict):
                 continue
-            for window in ("five_hour", "seven_day"):
-                resets_at = (entry.get(window) or {}).get("resets_at")
-                if not resets_at:
-                    continue
-                try:
-                    when = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if earliest is None or when < earliest:
-                    earliest = when
-        return earliest
+            blocked = [
+                resets_at
+                for _, pct, resets_at in oauth.relevant_windows(value, self._models)
+                if pct >= 100.0
+            ]
+            if not blocked:
+                continue  # not exhausted — doesn't gate the blocked state
+            usable_at = _limiting_reset_ts(value, self._models)
+            if usable_at is None:
+                return None  # blocked with unprovable recovery — don't oversleep
+            if earliest is None or usable_at < earliest:
+                earliest = usable_at
+        if earliest is None:
+            return None
+        return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)
@@ -1107,8 +1164,23 @@ class AutoSwitchEngine:
     # -- loop -------------------------------------------------------------------
 
     def stop(self) -> None:
-        """Ask ``run_loop`` to exit; wakes it from any sleep."""
+        """Ask ``run_loop`` to exit; wakes it from any sleep. Safe to call
+        before the loop starts — the stop is never cleared, so the loop
+        exits immediately (engines are single-use)."""
         self._stop.set()
+        self._wake.set()
+
+    def wake(self) -> None:
+        """Cut the current inter-tick sleep short and tick now."""
+        self._wake.set()
+
+    def apply_threshold(self, threshold: float) -> None:
+        """Session override from the TUI: retarget the trigger and poll
+        cadence mid-run. Threshold only — the model axes (and their derived
+        state) are fixed at construction. The frozen-settings swap is atomic
+        and each tick snapshots ``self.settings`` once, so no locking."""
+        self.settings = replace(self.settings, threshold=threshold)
+        self.switcher.set_poll_policy_inputs(threshold, self._models)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
@@ -1132,8 +1204,13 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
-        self._stop.clear()
-        while not self._stop.is_set():
+        while True:
+            # Clear at the top, not after the wait: a wake() racing a wait
+            # timeout is then never lost — the tick right after this clear
+            # already sees whatever settings that wake announced.
+            self._wake.clear()
+            if self._stop.is_set():
+                return 0
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards
@@ -1152,5 +1229,4 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-            self._stop.wait(delay)
-        return 0
+            self._wake.wait(delay)
